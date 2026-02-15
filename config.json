@@ -1,0 +1,32 @@
+{
+  "client": {
+    "auto_focus": true,
+    "input_delay": 0.1
+  },
+  "controller": {
+    "movement_speed": 1.0,
+    "mining_duration": 2.0,
+    "building_mode": false
+  },
+  "vision": {
+    "screen_capture_interval": 0.5,
+    "block_detection_enabled": true,
+    "show_markers": true
+  },
+  "language": {
+    "default_language": "zh",
+    "command_timeout": 5.0
+  },
+  "action": {
+    "plan_optimization": true,
+    "max_plan_depth": 3
+  },
+  "multimodal": {
+    "enabled": false,
+    "api_key": ""
+  },
+  "system": {
+    "debug_mode": true,
+    "log_level": "info"
+  }
+}

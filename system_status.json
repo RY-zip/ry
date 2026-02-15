@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-02-13T21:43:33.750028",
+  "scheduler_status": {
+    "running": true,
+    "task_count": 2,
+    "pending_tasks": 1,
+    "running_tasks": 1,
+    "completed_tasks": 0,
+    "error_tasks": 0
+  },
+  "running_tasks": [
+    "status",
+    "capture",
+    "exploration",
+    "gathering"
+  ]
+}

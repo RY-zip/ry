@@ -660,8 +660,8 @@ async def translate_text(text: str, target_lang: str, source_lang: Optional[str]
         if skip_google:
             logger.debug("⏭️ [翻译服务] 跳过 Google 翻译（会话级失败标记），直接使用 translatepy")
         elif GOOGLETRANS_AVAILABLE:
-            logger.debug(f"🌐 [翻译服务] 尝试 Google 翻译 (中文区优先，5秒超时): {source_lang} -> {target_lang}")
-            translated_text = await _try_google_translate(timeout=5.0)  # 5秒超时
+            logger.debug(f"🌐 [翻译服务] 尝试 Google 翻译 (中文区优先，2秒超时): {source_lang} -> {target_lang}")
+            translated_text = await _try_google_translate(timeout=2.0)  # 减少超时到2秒，加快字幕响应
             if translated_text:
                 logger.info(f"✅ [翻译服务] Google翻译成功: {source_lang} -> {target_lang}")
                 return translated_text, google_failed

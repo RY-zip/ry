@@ -135,7 +135,7 @@ function init_app() {
                 statusToast.classList.add('hide');
                 setTimeout(() => {
                     statusToast.textContent = '';
-                }, 300);
+                }, 100);
             }
             return;
         }

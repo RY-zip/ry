@@ -332,14 +332,7 @@ async def initialize_character_data():
     logger.info(f"角色配置加载完成，当前角色: {catgirl_names}，主人: {master_name}")
 
 # 初始化角色数据（使用asyncio.run在模块级别执行async函数）
-# 只在主进程中执行，防止 Windows 上子进程重复导入时再次启动子进程
-if _IS_MAIN_PROCESS:
-    import asyncio as _init_asyncio
-    try:
-        _init_asyncio.get_event_loop()
-    except RuntimeError:
-        _init_asyncio.set_event_loop(_init_asyncio.new_event_loop())
-    _init_asyncio.get_event_loop().run_until_complete(initialize_character_data())
+# 初始化角色数据将在 startup 事件中执行，避免事件循环冲突
 lock = asyncio.Lock()
 
 # --- FastAPI App Setup ---
@@ -406,6 +399,7 @@ from main_routers import ( # noqa
     websocket_router,
     agent_router,
     system_router,
+    minecraft_router,
 )
 from main_routers.shared_state import init_shared_state # noqa
 
@@ -449,6 +443,7 @@ app.include_router(live2d_router)
 app.include_router(vrm_router)
 app.include_router(workshop_router)
 app.include_router(memory_router)
+app.include_router(minecraft_router)
 # Note: pages_router should be mounted last due to catch-all route /{lanlan_name}
 app.include_router(websocket_router)
 app.include_router(agent_router)
@@ -595,6 +590,8 @@ async def on_startup():
     """服务器启动时执行的初始化操作"""
     if _IS_MAIN_PROCESS:
         global steamworks, _preload_task
+        logger.info("正在初始化角色配置...")
+        await initialize_character_data()
         logger.info("正在初始化 Steamworks...")
         steamworks = initialize_steamworks()
         
@@ -618,6 +615,16 @@ async def on_startup():
             logger.info(f"全局语言初始化完成: {global_lang}")
         except Exception as e:
             logger.warning(f"全局语言初始化失败: {e}，将使用默认值")
+        
+        # 设置 Neuro-Sama 智能体到 shared_state
+        try:
+            from main_routers.shared_state import set_neuro_agent
+            from agent_server import Modules
+            if hasattr(Modules, 'neuro_agent') and Modules.neuro_agent:
+                set_neuro_agent(Modules.neuro_agent)
+                logger.info("Neuro-Sama 智能体已添加到 shared_state")
+        except Exception as e:
+            logger.warning(f"设置 Neuro-Sama 智能体到 shared_state 失败: {e}")
 
 # 使用 FastAPI 的 app.state 来管理启动配置
 def get_start_config():

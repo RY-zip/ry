@@ -3,4 +3,6 @@ __all__ = [
     'processor',
     'planner',
     'analyzer',
+    'neuro_core',
+    'neuro_integrator',
 ]

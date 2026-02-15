@@ -313,6 +313,18 @@ class LLMSessionManager:
         # 推送到同步消息队列
         self.sync_message_queue.put({"type": "user", "data": {"input_type": "transcript", "data": transcript.strip()}})
         
+        # 通知 Neuro-Sama 智能体有新的聊天消息
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                await client.post(
+                    "http://localhost:48915/neuro/chat",
+                    json={"message": transcript.strip(), "sender": "user"}
+                )
+        except Exception as e:
+            # 如果 Neuro-Sama 智能体不可用，忽略错误
+            pass
+        
         # 只在语音模式（OmniRealtimeClient）下发送到前端显示用户转录
         # 文本模式下前端会自己显示，无需后端发送，避免重复
         if isinstance(self.session, OmniRealtimeClient):
@@ -340,6 +352,19 @@ class LLMSessionManager:
 
     async def handle_output_transcript(self, text: str, is_first_chunk: bool = False):
         """输出转录回调：处理文本显示和TTS（用于语音模式）"""        
+        # 如果是第一个chunk，通知 Neuro-Sama 智能体AI正在回答
+        if is_first_chunk:
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    await client.post(
+                        "http://localhost:48915/neuro/chat",
+                        json={"message": text[:50] + "...", "sender": "ai"}
+                    )
+            except Exception as e:
+                # 如果 Neuro-Sama 智能体不可用，忽略错误
+                pass
+        
         # 无论是否使用TTS，都要发送文本到前端显示
         await self.send_lanlan_response(text, is_first_chunk)
         

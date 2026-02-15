@@ -719,7 +719,7 @@ async def proactive_chat(request: Request):
         if not use_screenshot and not use_window_search:
             # 首页推荐主动对话
             try:
-                trending_content = await fetch_trending_content(bilibili_limit=10, weibo_limit=10)
+                trending_content = await fetch_trending_content(bilibili_limit=5, weibo_limit=5)
                 
                 if not trending_content['success']:
                     return JSONResponse({

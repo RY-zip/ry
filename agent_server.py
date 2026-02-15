@@ -12,8 +12,17 @@ import time
 import multiprocessing as mp
 import httpx
 
+
+
+# 添加键盘监听库
+try:
+    import keyboard
+    keyboard_available = True
+except ImportError:
+    keyboard_available = False
+
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from config import TOOL_SERVER_PORT, MAIN_SERVER_PORT ,USER_PLUGIN_SERVER_PORT
 from brain.processor import Processor
@@ -22,6 +31,7 @@ from brain.analyzer import ConversationAnalyzer
 from brain.computer_use import ComputerUseAdapter
 from brain.deduper import TaskDeduper
 from brain.task_executor import DirectTaskExecutor
+from brain.neuro_agent import NeuroSamaAgent
 
 
 app = FastAPI(title="N.E.K.O Tool Server")
@@ -51,10 +61,87 @@ class Modules:
     active_computer_use_task_id: Optional[str] = None
     # Agent feature flags (controlled by UI)
     agent_flags: Dict[str, Any] = {"mcp_enabled": False, "computer_use_enabled": False, "user_plugin_enabled": False}
+    # AI keyboard/mouse control flag
+    ai_control_enabled: bool = False
     # Notification queue for frontend (one-time messages)
     notification: Optional[str] = None
     # 使用统一的速率限制日志记录器（业务逻辑层面）
     throttled_logger: "ThrottledLogger" = None  # 延迟初始化
+    # HTTP客户端缓存
+    http_client: Optional[httpx.AsyncClient] = None
+    http_client_creation_time: float = 0
+    http_client_timeout: int = 300  # HTTP客户端缓存时间（秒）
+    # Neuro-Sama智能体
+    neuro_agent: Optional[NeuroSamaAgent] = None
+
+
+def _toggle_ai_control(enable: bool):
+    """
+    切换AI控制键盘鼠标的状态
+    
+    Args:
+        enable: 是否启用AI控制
+    """
+    Modules.ai_control_enabled = enable
+    status = "启用" if enable else "禁用"
+    logger.info(f"[AI Control] AI控制键盘鼠标已{status}")
+    # 发送通知给前端
+    Modules.notification = f"AI控制键盘鼠标已{status}（F11开启，F12关闭）"
+    
+    # 同时控制Neuro-Sama的鼠标控制
+    if hasattr(Modules, 'neuro_agent') and Modules.neuro_agent:
+        if enable:
+            Modules.neuro_agent.start_mouse_control()
+        else:
+            Modules.neuro_agent.stop_mouse_control()
+
+
+def _on_key_press(event):
+    """
+    处理键盘按键事件
+    
+    Args:
+        event: 键盘事件对象
+    """
+    if event.name == 'f11':
+        _toggle_ai_control(True)
+    elif event.name == 'f12':
+        _toggle_ai_control(False)
+
+
+def _start_keyboard_listener():
+    """
+    启动键盘监听
+    """
+    if keyboard_available:
+        try:
+            # 监听F11和F12键
+            keyboard.on_press(_on_key_press)
+            logger.info("[Keyboard Listener] 键盘监听已启动，按F11开启AI控制，按F12关闭AI控制")
+        except Exception as e:
+            logger.error(f"[Keyboard Listener] 启动键盘监听失败: {e}")
+    else:
+        logger.warning("[Keyboard Listener] 键盘监听库不可用，AI控制切换功能已禁用")
+
+async def get_http_client():
+    """
+    获取缓存的HTTP客户端
+    """
+    import time
+    current_time = time.time()
+    
+    if Modules.http_client is None or current_time - Modules.http_client_creation_time > Modules.http_client_timeout:
+        # 创建新的HTTP客户端
+        Modules.http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(5.0, connect=2.0),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
+        )
+        Modules.http_client_creation_time = current_time
+        logger.info("[HTTP] Created new HTTP client")
+    else:
+        logger.info("[HTTP] Using cached HTTP client")
+    
+    return Modules.http_client
 def _collect_existing_task_descriptions(lanlan_name: Optional[str] = None) -> list[tuple[str, str]]:
     """Return list of (task_id, description) for queued/running tasks, optionally filtered by lanlan_name."""
     items: list[tuple[str, str]] = []
@@ -190,6 +277,13 @@ def _spawn_task(kind: str, args: Dict[str, Any]) -> Dict[str, Any]:
         Modules.result_queue = mp.Queue()
     
     if kind == "computer_use":
+        # 检查AI控制是否启用
+        if not Modules.ai_control_enabled:
+            info["status"] = "failed"
+            info["error"] = "AI控制键盘鼠标已禁用，请按F11开启"
+            Modules.task_registry[task_id] = info
+            return info
+        
         # Queue the task for exclusive execution by the scheduler
         info["status"] = "queued"
         info["pid"] = None
@@ -220,11 +314,11 @@ def _spawn_task(kind: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 if result.get("can_execute"):
                     summary = f'你的任务\"{query[:50]}\"已完成'
                     try:
-                        async with httpx.AsyncClient(timeout=0.5) as _client:
-                            await _client.post(
-                                f"http://localhost:{MAIN_SERVER_PORT}/api/agent/notify_task_result",
-                                json={"text": summary[:240], "lanlan_name": info.get("lanlan_name")},
-                            )
+                        _client = await get_http_client()
+                        await _client.post(
+                            f"http://localhost:{MAIN_SERVER_PORT}/api/agent/notify_task_result",
+                            json={"text": summary[:240], "lanlan_name": info.get("lanlan_name")},
+                        )
                     except Exception:
                         pass
                 logger.info(f"[MCP] ✅ Spawned processor task {task_id} completed")
@@ -313,11 +407,11 @@ async def _poll_results_loop():
                             summary = f"你的任务 “{desc}” 已完成"[:240]
                     except Exception:
                         pass
-                    async with httpx.AsyncClient(timeout=0.5) as _client:
-                        await _client.post(
-                            f"http://localhost:{MAIN_SERVER_PORT}/api/agent/notify_task_result",
-                            json={"text": summary, "lanlan_name": info.get("lanlan_name")},
-                        )
+                    _client = await get_http_client()
+                    await _client.post(
+                        f"http://localhost:{MAIN_SERVER_PORT}/api/agent/notify_task_result",
+                        json={"text": summary, "lanlan_name": info.get("lanlan_name")},
+                    )
                 except Exception:
                     pass
         except Exception:
@@ -430,11 +524,11 @@ async def _background_analyze_and_plan(messages: list[dict[str, Any]], lanlan_na
                 
                 # 通知 main_server
                 try:
-                    async with httpx.AsyncClient(timeout=0.5) as _client:
-                        await _client.post(
-                            f"http://localhost:{MAIN_SERVER_PORT}/api/agent/notify_task_result",
-                            json={"text": summary[:240], "lanlan_name": lanlan_name},
-                        )
+                    _client = await get_http_client()
+                    await _client.post(
+                        f"http://localhost:{MAIN_SERVER_PORT}/api/agent/notify_task_result",
+                        json={"text": summary[:240], "lanlan_name": lanlan_name},
+                    )
                     logger.info(f"[TaskExecutor] ✅ MCP task completed and notified: {result.task_description}")
                 except Exception as e:
                     logger.warning(f"[TaskExecutor] Failed to notify main_server: {e}")
@@ -472,6 +566,9 @@ async def startup():
     Modules.processor = Processor()
     Modules.planner = TaskPlanner(computer_use=Modules.computer_use)
     Modules.analyzer = ConversationAnalyzer()
+    
+    # 启动键盘监听
+    _start_keyboard_listener()
     
     # Warm up router discovery
     try:
@@ -514,13 +611,127 @@ async def startup():
         Modules.poller_task = asyncio.create_task(_poll_results_loop())
     # Start computer-use scheduler
     asyncio.create_task(_computer_use_scheduler_loop())
+
+    # 初始化 Neuro-Sama 智能体
+    Modules.neuro_agent = NeuroSamaAgent("Neuro-Sama")
+    Modules.neuro_agent.start()
+    logger.info("[Agent] ✅ Neuro-Sama 智能体已启动")
     
+    # 设置 Minecraft 路由器的 NeuroSamaAgent 实例引用
+    try:
+        from main_routers.minecraft_router import set_neuro_agent
+        set_neuro_agent(Modules.neuro_agent)
+        logger.info("[Agent] ✅ 已设置 Minecraft 路由器的 NeuroSamaAgent 实例引用")
+    except Exception as e:
+        logger.warning(f"[Agent] 设置 Minecraft 路由器的 NeuroSamaAgent 实例引用失败: {e}")
+
     logger.info("[Agent] ✅ Agent server started with simplified task executor")
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "agent_flags": Modules.agent_flags}
+
+
+@app.get("/neuro/status")
+async def neuro_status():
+    """获取 Neuro-Sama 智能体状态"""
+    if not Modules.neuro_agent:
+        return {"status": "not_initialized"}
+    return Modules.neuro_agent.get_status()
+
+
+@app.post("/neuro/start")
+async def neuro_start():
+    """启动 Neuro-Sama 智能体"""
+    if not Modules.neuro_agent:
+        Modules.neuro_agent = NeuroSamaAgent("Neuro-Sama")
+    success = Modules.neuro_agent.start()
+    if success:
+        return {"status": "started", "message": "Neuro-Sama 智能体已启动"}
+    else:
+        return {"status": "already_running", "message": "Neuro-Sama 智能体已在运行中"}
+
+
+@app.post("/neuro/stop")
+async def neuro_stop():
+    """停止 Neuro-Sama 智能体"""
+    if not Modules.neuro_agent:
+        return {"status": "not_initialized", "message": "Neuro-Sama 智能体未初始化"}
+    Modules.neuro_agent.stop()
+    return {"status": "stopped", "message": "Neuro-Sama 智能体已停止"}
+
+
+@app.post("/neuro/chat")
+async def neuro_chat(payload: Dict[str, Any]):
+    """发送聊天消息给 Neuro-Sama 智能体"""
+    if not Modules.neuro_agent:
+        return {"status": "not_initialized", "message": "Neuro-Sama 智能体未初始化"}
+    
+    message = (payload or {}).get("message", "").strip()
+    sender = (payload or {}).get("sender", "user")
+    
+    if not message:
+        return {"status": "error", "message": "消息内容不能为空"}
+    
+    # 添加聊天消息到智能体
+    Modules.neuro_agent.add_chat_message(message, sender)
+    
+    return {"status": "success", "message": "消息已发送"}
+
+
+@app.get("/neuro/mouse/status")
+async def neuro_mouse_status():
+    """获取 Neuro-Sama 智能体的鼠标控制状态"""
+    if not Modules.neuro_agent:
+        return {"status": "not_initialized", "message": "Neuro-Sama 智能体未初始化"}
+    
+    return Modules.neuro_agent.get_mouse_control_status()
+
+
+@app.post("/neuro/mouse/start")
+async def neuro_mouse_start():
+    """开始 Neuro-Sama 智能体的鼠标控制"""
+    if not Modules.neuro_agent:
+        return {"status": "not_initialized", "message": "Neuro-Sama 智能体未初始化"}
+    
+    success = Modules.neuro_agent.start_mouse_control()
+    if success:
+        return {"status": "success", "message": "鼠标控制已启动"}
+    else:
+        return {"status": "error", "message": "鼠标控制启动失败"}
+
+
+@app.post("/neuro/mouse/stop")
+async def neuro_mouse_stop():
+    """停止 Neuro-Sama 智能体的鼠标控制"""
+    if not Modules.neuro_agent:
+        return {"status": "not_initialized", "message": "Neuro-Sama 智能体未初始化"}
+    
+    success = Modules.neuro_agent.stop_mouse_control()
+    if success:
+        return {"status": "success", "message": "鼠标控制已停止"}
+    else:
+        return {"status": "error", "message": "鼠标控制停止失败"}
+
+
+@app.post("/neuro/taskbar/move")
+async def neuro_taskbar_move(payload: Dict[str, Any]):
+    """控制 Neuro-Sama 智能体移动到任务栏指定区域"""
+    if not Modules.neuro_agent:
+        return {"status": "not_initialized", "message": "Neuro-Sama 智能体未初始化"}
+    
+    target_area = (payload or {}).get("target_area", "center").strip()
+    valid_areas = ["center", "left", "right", "system_tray"]
+    
+    if target_area not in valid_areas:
+        return {"status": "error", "message": f"无效的目标区域，有效值: {', '.join(valid_areas)}"}
+    
+    success = Modules.neuro_agent.taskbar_movement(target_area)
+    if success:
+        return {"status": "success", "message": f"已成功移动到任务栏{target_area}区域"}
+    else:
+        return {"status": "error", "message": "任务栏移动失败"}
 
 
 # 1) 处理器模块：接受自然语言query，直接执行MCP工具（不再使用子进程）
@@ -585,6 +796,32 @@ async def process_query(payload: Dict[str, Any]):
     logger.info(f"[MCP] Started processor task {task_id} for {lanlan_name}")
     return {"success": True, "task_id": task_id, "status": info["status"], "start_time": info["start_time"]}
 
+@app.post("/stream_process")
+async def stream_process_query(payload: Dict[str, Any]):
+    """
+    流式处理自然语言查询，实时返回处理结果
+    """
+    if not Modules.processor:
+        raise HTTPException(503, "Processor not ready")
+    query = (payload or {}).get("query", "").strip()
+    if not query:
+        raise HTTPException(400, "query required")
+    lanlan_name = (payload or {}).get("lanlan_name")
+    
+    logger.info(f"[MCP] Received stream process request from {lanlan_name}: {query[:100]}...")
+    
+    # 异步生成器函数，用于流式返回结果
+    async def generate():
+        try:
+            async for chunk in Modules.processor.stream_process(query):
+                yield chunk.encode("utf-8")
+        except Exception as e:
+            error_msg = f"❌ 处理出错：{str(e)}\n"
+            yield error_msg.encode("utf-8")
+            logger.error(f"[MCP] Stream process failed: {e}")
+    
+    return StreamingResponse(generate(), media_type="text/plain")
+
 # 插件直接触发路由（放在顶层，确保不在其它函数体内）
 @app.post("/plugin/execute")
 async def plugin_execute_direct(payload: Dict[str, Any]):
@@ -646,11 +883,11 @@ async def plugin_execute_direct(payload: Dict[str, Any]):
             if accepted:
                 try:
                     summary = f'插件任务 "{plugin_id}" 已接受'
-                    async with httpx.AsyncClient(timeout=0.5) as _client:
-                        await _client.post(
-                            f"http://localhost:{MAIN_SERVER_PORT}/api/agent/notify_task_result",
-                            json={"text": summary[:240], "lanlan_name": lanlan_name},
-                        )
+                    _client = await get_http_client()
+                    await _client.post(
+                        f"http://localhost:{MAIN_SERVER_PORT}/api/agent/notify_task_result",
+                        json={"text": summary[:240], "lanlan_name": lanlan_name},
+                    )
                 except Exception:
                     pass
         except Exception as e:

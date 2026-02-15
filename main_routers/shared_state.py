@@ -25,6 +25,7 @@ _state = {
     'config_manager': _UNSET,
     'logger': _UNSET,
     'initialize_character_data': _UNSET,  # Function reference
+    'neuro_agent': None,  # Neuro-Sama智能体实例
 }
 
 
@@ -137,3 +138,17 @@ def get_initialize_character_data():
     """Get the initialize_character_data function reference"""
     _check_initialized('initialize_character_data')
     return _state['initialize_character_data']
+
+
+def get_neuro_agent():
+    """Get the Neuro-Sama agent instance.
+    
+    Note: This may return None if the agent is not initialized.
+    We do NOT call _check_initialized here because None is a valid value.
+    """
+    return _state['neuro_agent']
+
+
+def set_neuro_agent(neuro_agent):
+    """Set the Neuro-Sama agent instance (called during startup event)."""
+    _state['neuro_agent'] = neuro_agent

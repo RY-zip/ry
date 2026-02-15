@@ -81,6 +81,17 @@ class DirectTaskExecutor:
         self.plugin_list = []
         self.user_plugin_enabled_default = False
         self._external_plugin_provider: Optional[Callable[[bool], Awaitable[List[Dict[str, Any]]]]] = None
+        # 缓存属性
+        self._capabilities_cache = None
+        self._capabilities_cache_time = 0
+        self._cache_timeout = 30  # 缓存超时时间（秒）
+        # LLM客户端缓存
+        self._llm_client_cache = None
+        self._llm_client_cache_time = 0
+        self._llm_cache_timeout = 60  # LLM客户端缓存超时时间（秒）
+        # 插件列表缓存
+        self._plugin_list_cache_time = 0
+        self._plugin_cache_timeout = 60  # 插件列表缓存超时时间（秒）
     
     
     def set_plugin_list_provider(self, provider: Callable[[bool], Awaitable[List[Dict[str, Any]]]]):
@@ -88,8 +99,12 @@ class DirectTaskExecutor:
         self._external_plugin_provider = provider
 
     async def plugin_list_provider(self, force_refresh: bool = True) -> List[Dict[str, Any]]:
-        # return cached list when allowed
-        if self.plugin_list and not force_refresh:
+        import time
+        current_time = time.time()
+        
+        # Check if cache is valid
+        if self.plugin_list and not force_refresh and current_time - self._plugin_list_cache_time < self._plugin_cache_timeout:
+            logger.info(f"[Agent] Using cached plugin list, found {len(self.plugin_list)} plugins")
             return self.plugin_list
 
         # try external provider first (e.g., injected by agent_server)
@@ -98,41 +113,76 @@ class DirectTaskExecutor:
                 plugins = await self._external_plugin_provider(force_refresh)
                 if isinstance(plugins, list):
                     self.plugin_list = plugins
-                    logger.info(f"[Agent] Loaded {len(self.plugin_list)} plugins via external provider")
+                    self._plugin_list_cache_time = current_time
+                    logger.info(f"[Agent] Updated plugin list via external provider, found {len(self.plugin_list)} plugins")
                     return self.plugin_list
             except Exception as e:
                 logger.warning(f"[Agent] external plugin_list_provider failed: {e}")
 
         # fallback to built-in HTTP fetcher
-        if (self.plugin_list == []) or force_refresh:
-            try:
-                url = f"http://localhost:{USER_PLUGIN_SERVER_PORT}/plugins"
-                # increase timeout and avoid awaiting a non-awaitable .json()
-                timeout = httpx.Timeout(5.0, connect=2.0)
-                async with httpx.AsyncClient(timeout=timeout) as _client:
-                    resp = await _client.get(url)
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        logger.warning("[Agent] Failed to parse plugins response as JSON")
-                        data = {}
-                    plugin_list = data.get("plugins", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                    # only update cache when we obtained a non-empty list
-                    if plugin_list:
-                        self.plugin_list = plugin_list  # 更新实例变量
-            except Exception as e:
-                logger.warning(f"[Agent] plugin_list_provider http fetch failed: {e}")
+        try:
+            url = f"http://localhost:{USER_PLUGIN_SERVER_PORT}/plugins"
+            # increase timeout and avoid awaiting a non-awaitable .json()
+            timeout = httpx.Timeout(5.0, connect=2.0)
+            async with httpx.AsyncClient(timeout=timeout) as _client:
+                resp = await _client.get(url)
+                try:
+                    data = resp.json()
+                except Exception:
+                    logger.warning("[Agent] Failed to parse plugins response as JSON")
+                    data = {}
+                plugin_list = data.get("plugins", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                # only update cache when we obtained a non-empty list
+                if plugin_list:
+                    self.plugin_list = plugin_list  # 更新实例变量
+                    self._plugin_list_cache_time = current_time
+                    logger.info(f"[Agent] Updated plugin list via HTTP, found {len(self.plugin_list)} plugins")
+                else:
+                    logger.info(f"[Agent] No plugins found, using cached list with {len(self.plugin_list)} plugins")
+        except Exception as e:
+            logger.warning(f"[Agent] plugin_list_provider http fetch failed: {e}")
+        
         logger.info(f"[Agent] Loaded {len(self.plugin_list)} plugins: {[p.get('id', 'unknown') for p in self.plugin_list if isinstance(p, dict)]}")
         return self.plugin_list
 
 
+    async def _get_cached_capabilities(self, force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+        """获取缓存的 MCP 工具能力列表"""
+        import time
+        current_time = time.time()
+        
+        if force_refresh or self._capabilities_cache is None or current_time - self._capabilities_cache_time > self._cache_timeout:
+            try:
+                capabilities = await self.catalog.get_capabilities(force_refresh=force_refresh)
+                self._capabilities_cache = capabilities
+                self._capabilities_cache_time = current_time
+                logger.info(f"[MCP] Updated capabilities cache, found {len(capabilities)} tools")
+            except Exception as e:
+                logger.warning(f"[MCP] Failed to get capabilities: {e}")
+                return {}
+        else:
+            capabilities = self._capabilities_cache
+            logger.info(f"[MCP] Using cached capabilities, found {len(capabilities)} tools")
+        
+        return capabilities
+
     def _get_client(self):
-        """动态获取 OpenAI 客户端"""
-        api_config = self._config_manager.get_model_api_config('summary')
-        return AsyncOpenAI(
-            api_key=api_config['api_key'],
-            base_url=api_config['base_url']
-        )
+        """动态获取 OpenAI 客户端（带缓存）"""
+        import time
+        current_time = time.time()
+        
+        if self._llm_client_cache is None or current_time - self._llm_client_cache_time > self._llm_cache_timeout:
+            api_config = self._config_manager.get_model_api_config('summary')
+            self._llm_client_cache = AsyncOpenAI(
+                api_key=api_config['api_key'],
+                base_url=api_config['base_url']
+            )
+            self._llm_client_cache_time = current_time
+            logger.info("[LLM] Created new OpenAI client")
+        else:
+            logger.info("[LLM] Using cached OpenAI client")
+        
+        return self._llm_client_cache
     
     def _get_model(self):
         """获取模型名称"""
@@ -566,7 +616,7 @@ Return only the JSON object, nothing else.
         capabilities = {}
         if mcp_enabled:
             try:
-                capabilities = await self.catalog.get_capabilities(force_refresh=True)
+                capabilities = await self._get_cached_capabilities(force_refresh=False)
                 logger.info(f"[TaskExecutor] Found {len(capabilities)} MCP tools")
             except Exception as e:
                 logger.warning(f"[TaskExecutor] Failed to get MCP capabilities: {e}")
@@ -948,4 +998,4 @@ Return only the JSON object, nothing else.
     
     async def refresh_capabilities(self) -> Dict[str, Dict[str, Any]]:
         """刷新并返回 MCP 工具能力列表"""
-        return await self.catalog.get_capabilities(force_refresh=True)
+        return await self._get_cached_capabilities(force_refresh=True)

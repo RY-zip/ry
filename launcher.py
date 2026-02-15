@@ -36,6 +36,7 @@ import socket
 import time
 import threading
 import itertools
+from datetime import datetime
 from typing import List, Dict
 from multiprocessing import Process, freeze_support, Event
 from config import MAIN_SERVER_PORT, MEMORY_SERVER_PORT, TOOL_SERVER_PORT
@@ -60,6 +61,13 @@ SERVERS = [
         'name': 'Main Server',
         'module': 'main_server',
         'port': MAIN_SERVER_PORT,
+        'process': None,
+        'ready_event': None,
+    },
+    {
+        'name': 'AI Control',
+        'module': 'ai_control',
+        'port': None,  # ai_control 不是服务器，不需要端口
         'process': None,
         'ready_event': None,
     },
@@ -214,6 +222,33 @@ def run_main_server(ready_event: Event):
         import traceback
         traceback.print_exc()
 
+def run_ai_control(ready_event: Event):
+    """运行 AI Control 程序"""
+    try:
+        # 确保工作目录正确
+        if getattr(sys, 'frozen', False):
+            if hasattr(sys, '_MEIPASS'):
+                # PyInstaller
+                os.chdir(sys._MEIPASS)
+            else:
+                # Nuitka
+                os.chdir(os.path.dirname(os.path.abspath(__file__)))
+        
+        print("[AI Control] Starting AI Control program...")
+        
+        # 立即通知就绪，因为 ai_control 是一个后台程序
+        ready_event.set()
+        
+        # 导入并运行 ai_control
+        import ai_control
+        
+        # 调用 ai_control 的主函数
+        ai_control.main()
+    except Exception as e:
+        print(f"AI Control error: {e}")
+        import traceback
+        traceback.print_exc()
+
 def check_port(port: int, timeout: float = 0.5) -> bool:
     """检查端口是否已开放"""
     try:
@@ -246,6 +281,8 @@ def start_server(server: Dict) -> bool:
             target_func = run_agent_server
         elif server['module'] == 'main_server':
             target_func = run_main_server
+        elif server['module'] == 'ai_control':
+            target_func = run_ai_control
         else:
             print(f"✗ {server['name']} 未知模块", flush=True)
             return False
@@ -281,7 +318,10 @@ def wait_for_servers(timeout: int = 60) -> bool:
     while time.time() - start_time < timeout:
         ready_count = 0
         for server in SERVERS:
-            if check_port(server['port']) or server['port']==TOOL_SERVER_PORT:
+            if server['port'] is None:
+                # ai_control 没有端口，直接视为就绪
+                ready_count += 1
+            elif check_port(server['port']) or server['port']==TOOL_SERVER_PORT:
                 ready_count += 1
         
         if ready_count == len(SERVERS):
@@ -353,29 +393,45 @@ def main():
     # 支持 multiprocessing 在 Windows 上的打包
     freeze_support()
     
+    # 记录程序启动时间
+    start_time = time.time()
+    start_datetime = datetime.now()
+    
     print("=" * 60, flush=True)
     print("N.E.K.O. 服务器启动器", flush=True)
     print("=" * 60, flush=True)
     
+    # 记录发生的事情
+    events = [
+        f"程序启动于: {start_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+    ]
+    
     try:
         # 1. 启动所有服务器
         print("\n正在启动服务器...\n", flush=True)
+        events.append("开始启动所有服务器")
         all_started = True
         for server in SERVERS:
             if not start_server(server):
                 all_started = False
+                events.append(f"❌ {server['name']} 启动失败")
                 break
+            events.append(f"✅ {server['name']} 已启动")
         
         if not all_started:
             print("\n启动失败，正在清理...", flush=True)
+            events.append("启动失败，开始清理")
             cleanup_servers()
             return 1
         
         # 2. 等待服务器准备就绪
+        events.append("等待服务器准备就绪")
         if not wait_for_servers():
             print("\n启动失败，正在清理...", flush=True)
+            events.append("服务器准备超时，启动失败")
             cleanup_servers()
             return 1
+        events.append("✅ 所有服务器已准备就绪")
         
         # 3. 服务器已启动，等待用户操作
         print("", flush=True)
@@ -384,9 +440,14 @@ def main():
         print("\n  现在你可以：", flush=True)
         print("  1. 启动 lanlan_frd.exe 使用系统", flush=True)
         print("  2. 在浏览器访问 http://localhost:48911", flush=True)
+        print("\n  AI Control 已自动启动，功能如下：", flush=True)
+        print("  - 按 F11 启用 AI 控制鼠标和键盘", flush=True)
+        print("  - 按 F12 禁用 AI 控制鼠标和键盘", flush=True)
+        print("  - 默认已启用自动对话分析", flush=True)
         print("\n  按 Ctrl+C 关闭所有服务器", flush=True)
         print("=" * 60, flush=True)
         print("", flush=True)
+        events.append("服务器已准备就绪，等待用户操作")
         
         # 持续运行，监控服务器状态
         while True:
@@ -398,18 +459,201 @@ def main():
             )
             if not all_alive:
                 print("\n检测到服务器异常退出！", flush=True)
+                events.append("⚠️ 检测到服务器异常退出")
                 break
         
     except KeyboardInterrupt:
         print("\n\n收到中断信号，正在关闭...", flush=True)
+        events.append("收到中断信号，开始关闭服务器")
     except Exception as e:
-        print(f"\n发生错误: {e}", flush=True)
+        error_msg = f"\n发生错误: {e}"
+        print(error_msg, flush=True)
+        events.append(f"❌ 发生错误: {e}")
     finally:
         cleanup_servers()
         print("\n所有服务器已关闭", flush=True)
         print("再见！\n", flush=True)
+        
+        # 记录程序退出时间
+        end_time = time.time()
+        end_datetime = datetime.now()
+        run_duration = end_time - start_time
+        events.append(f"程序退出于: {end_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+        events.append(f"总运行时间: {time.strftime('%H:%M:%S', time.gmtime(run_duration))}")
+        
+        # 调用独立的日记生成函数
+        generate_diary(start_datetime, events, end_datetime, run_duration)
     
     return 0
+
+def generate_diary(start_datetime, events, end_datetime, run_duration):
+    """生成日记的独立函数"""
+    try:
+        # 确保日记目录存在
+        diary_dir = "F:\\日记"
+        if not os.path.exists(diary_dir):
+            os.makedirs(diary_dir)
+        
+        # 生成日记文件名（格式：2024-01-01_21-30-45_日记.txt）
+        # 使用日期+时间格式命名，确保当天的日记都写入同一个文件
+        diary_filename = os.path.join(diary_dir, f"{start_datetime.strftime('%Y-%m-%d')}_日记.txt")
+        
+        # 生成日记内容
+        diary_content = [
+            "=" * 50,
+            "N.E.K.O. 系统运行日记",
+            "=" * 50,
+            f"日期: {start_datetime.strftime('%Y-%m-%d')}",
+            f"启动时间: {start_datetime.strftime('%H:%M:%S')}",
+            f"退出时间: {end_datetime.strftime('%H:%M:%S')}",
+            f"运行时长: {time.strftime('%H:%M:%S', time.gmtime(run_duration))}",
+            "\n今日发生的事情：",
+            "-" * 30
+        ]
+        
+        # 添加事件记录
+        for event in events:
+            diary_content.append(f"• {event}")
+        
+        # 添加对话内容
+        diary_content.extend([
+            "",
+            "\n今日对话内容：",
+            "-" * 30
+        ])
+        
+        # 获取对话历史
+        try:
+            from memory.recent import CompressedRecentHistoryManager
+            from utils.config_manager import get_config_manager
+            
+            # 初始化配置管理器和历史记录管理器
+            _config_manager = get_config_manager()
+            recent_history_manager = CompressedRecentHistoryManager()
+            
+            # 获取所有角色
+            try:
+                character_data = _config_manager.load_characters()
+                catgirl_names = list(character_data.get('猫娘', {}).keys())
+            except Exception as e:
+                catgirl_names = []
+                print(f"\n⚠️ 获取角色列表失败: {e}")
+            
+            # 如果没有角色，添加默认角色
+            if not catgirl_names:
+                # 尝试从memory目录获取所有recent_*.json文件
+                import glob
+                memory_dir = str(_config_manager.memory_dir)
+                recent_files = glob.glob(os.path.join(memory_dir, 'recent_*.json'))
+                catgirl_names = [os.path.basename(f).replace('recent_', '').replace('.json', '') for f in recent_files]
+            
+            # 为每个角色添加对话历史
+            for lanlan_name in catgirl_names:
+                try:
+                    # 获取最近的对话历史
+                    history = recent_history_manager.get_recent_history(lanlan_name)
+                    if history:
+                        diary_content.append(f"\n【{lanlan_name}的对话记录】")
+                        
+                        # 遍历历史记录，只添加最近的10条对话
+                        for msg in history[-10:]:  # 只显示最近10条
+                            # 处理不同类型的消息
+                            if hasattr(msg, 'type'):
+                                if msg.type == 'system':
+                                    # 跳过系统消息
+                                    continue
+                                elif msg.type == 'ai' or msg.type == 'assistant':
+                                    role = lanlan_name
+                                elif msg.type == 'user' or msg.type == 'human':
+                                    role = "主人"
+                                else:
+                                    role = msg.type
+                            else:
+                                role = "未知"
+                            
+                            # 处理消息内容
+                            if hasattr(msg, 'content'):
+                                if isinstance(msg.content, str):
+                                    content = msg.content
+                                elif isinstance(msg.content, list):
+                                    # 提取文本内容
+                                    text_parts = []
+                                    for item in msg.content:
+                                        if isinstance(item, dict):
+                                            if item.get('type') == 'text':
+                                                text_parts.append(item.get('text', ''))
+                                        else:
+                                            text_parts.append(str(item))
+                                    content = "\n".join(text_parts)
+                                else:
+                                    content = str(msg.content)
+                            else:
+                                content = str(msg)
+                            
+                            # 只添加非空内容
+                            if content.strip():
+                                diary_content.append(f"{role}: {content}")
+                except Exception as e:
+                    print(f"\n⚠️ 获取{lanlan_name}的对话历史失败: {e}")
+        except Exception as e:
+            diary_content.append("⚠️ 无法获取对话历史")
+            print(f"\n⚠️ 获取对话历史失败: {e}")
+        
+        # 添加学习到的内容
+        diary_content.extend([
+            "",
+            "\n今日学习内容：",
+            "-" * 30
+        ])
+        
+        # 尝试获取学习内容（设置、重要信息等）
+        try:
+            from memory.important_settings import ImportantSettingsManager
+            
+            settings_manager = ImportantSettingsManager()
+            
+            for lanlan_name in catgirl_names:
+                try:
+                    settings = settings_manager.get_settings(lanlan_name)
+                    if settings:
+                        diary_content.append(f"\n【{lanlan_name}学习到的内容】")
+                        for key, value in settings.items():
+                            diary_content.append(f"• {key}: {value}")
+                except Exception as e:
+                    print(f"\n⚠️ 获取{lanlan_name}的学习内容失败: {e}")
+        except Exception as e:
+            diary_content.append("⚠️ 无法获取学习内容")
+            print(f"\n⚠️ 获取学习内容失败: {e}")
+        
+        # 如果没有学习内容，添加提示
+        if "今日学习内容：" in diary_content and "⚠️ 无法获取学习内容" not in diary_content:
+            # 检查是否有实际的学习内容
+            has_learning_content = False
+            for line in diary_content:
+                if line.startswith("• ") and "今日学习内容：" in diary_content[:diary_content.index(line)]:
+                    has_learning_content = True
+                    break
+            if not has_learning_content:
+                diary_content.append("• 今日没有学习到新内容")
+        
+        # 添加结束语
+        diary_content.extend([
+            "",
+            "-" * 30,
+            "日记结束",
+            "=" * 50
+        ])
+        
+        # 写入日记文件
+        with open(diary_filename, "a", encoding="utf-8") as f:
+            f.write("\n".join(diary_content))
+            f.write("\n\n")  # 空两行作为分隔
+        
+        print(f"\n📝 日记已生成：{diary_filename}", flush=True)
+    except Exception as e:
+        print(f"\n⚠️ 生成日记失败: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     sys.exit(main())

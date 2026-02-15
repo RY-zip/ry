@@ -20,6 +20,10 @@ class Processor:
         self.router = McpRouterClient()
         self.catalog = McpToolCatalog(self.router)
         self._config_manager = get_config_manager()
+        # 初始化缓存属性
+        self._capabilities_cache = None
+        self._capabilities_cache_time = 0
+        self._cache_timeout = 30  # 缓存超时时间（秒）
     
     def _get_llm(self):
         """动态获取LLM实例以支持配置热重载"""
@@ -27,7 +31,18 @@ class Processor:
         return ChatOpenAI(model=api_config['model'], base_url=api_config['base_url'], api_key=api_config['api_key'], temperature=0, extra_body=get_extra_body(api_config['model']) or None)
 
     async def process(self, query: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        capabilities = await self.catalog.get_capabilities()
+        # 使用缓存的工具能力，减少获取延迟
+        import time
+        current_time = time.time()
+        
+        if self._capabilities_cache is None or current_time - self._capabilities_cache_time > self._cache_timeout:
+            capabilities = await self.catalog.get_capabilities()
+            self._capabilities_cache = capabilities
+            self._capabilities_cache_time = current_time
+            logger.info(f"[MCP] Updated capabilities cache, found {len(capabilities)} tools")
+        else:
+            capabilities = self._capabilities_cache
+            logger.info(f"[MCP] Using cached capabilities, found {len(capabilities)} tools")
         
         # Log MCP capabilities
         logger.info(f"[MCP] Processing query: {query[:100]}...")
@@ -137,6 +152,135 @@ class Processor:
             logger.info(f"[MCP] ❌ Query cannot be processed by MCP: {reason}")
         
         return parsed
+        
+    async def stream_process(self, query: str, context: Optional[Dict[str, Any]] = None):
+        """
+        流式处理自然语言查询，实时返回处理结果
+        
+        Args:
+            query: 用户查询
+            context: 上下文信息
+            
+        Yields:
+            处理过程中的实时结果
+        """
+        # 1. 使用缓存的工具能力，减少获取延迟
+        import time
+        current_time = time.time()
+        
+        if self._capabilities_cache is None or current_time - self._capabilities_cache_time > self._cache_timeout:
+            capabilities = await self.catalog.get_capabilities()
+            self._capabilities_cache = capabilities
+            self._capabilities_cache_time = current_time
+            yield f"🔄 更新工具能力缓存，发现 {len(capabilities)} 个可用工具\n"
+        else:
+            capabilities = self._capabilities_cache
+            yield f"✅ 使用缓存的工具能力，发现 {len(capabilities)} 个可用工具\n"
+        
+        yield f"🔍 正在分析查询：{query[:50]}...\n"
+        yield f"✅ 发现 {len(capabilities)} 个可用工具\n"
+        
+        tools_brief = "\n".join([f"- {k}: {v['description']} (status={v['status']})" for k, v in capabilities.items()])
+        system = (
+            "You are a tool routing agent. Given a user task, select one MCP server capability by id and"
+            " produce a concise JSON with fields: can_execute (boolean), reason, server_id, tool_calls (list of specific tool names that would be used)."
+            " If a server can handle the task, set can_execute=true, provide server_id, and list the specific tools that would be called."
+            " If no server fits or status is not online, set can_execute=false with reason."
+            " For tool_calls, be specific about which tools from the server would be used (e.g., ['save_memory', 'retrieve_memory'])."
+        )
+        user = f"Capabilities:\n{tools_brief}\n\nTask: {query}"
+        
+        # 2. 调用LLM进行流式处理
+        yield "🤖 正在调用大语言模型...\n"
+        
+        max_retries = 3
+        retry_delays = [1, 2]
+        text = ""
+        
+        for attempt in range(max_retries):
+            try:
+                llm = self._get_llm()
+                
+                # 使用流式调用
+                async for chunk in llm.astream([
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ]):
+                    if chunk.content:
+                        text += chunk.content
+                        yield chunk.content  # 实时返回LLM生成的内容
+                break
+            except (APIConnectionError, InternalServerError, RateLimitError) as e:
+                yield f"⚠️ LLM调用失败，{retry_delays[attempt]}秒后重试...\n"
+                await asyncio.sleep(retry_delays[attempt])
+            except Exception as e:
+                yield f"❌ LLM调用失败：{e}\n"
+                return
+        
+        yield "\n✅ LLM分析完成\n"
+        
+        # 3. 解析LLM结果
+        import json
+        try:
+            if text.startswith("```"):
+                text = text.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(text)
+            
+            # Ensure can_execute field exists and is boolean
+            if 'can_execute' not in parsed:
+                # If server_id is provided, assume it can execute
+                parsed['can_execute'] = bool(parsed.get('server_id'))
+        except Exception as e:
+            yield f"❌ JSON解析错误：{e}\n"
+            return
+        
+        # 4. 执行工具调用（如果需要）
+        if parsed.get('can_execute'):
+            server_id = parsed.get('server_id', 'unknown')
+            reason = parsed.get('reason', 'no reason provided')
+            tool_calls = parsed.get('tool_calls', [])
+            
+            yield f"✅ 选择服务器：{server_id}\n"
+            yield f"📋 使用工具：{', '.join(tool_calls)}\n"
+            
+            if tool_calls:
+                tool_results = []
+                for tool_name in tool_calls:
+                    yield f"🔧 正在执行工具：{tool_name}...\n"
+                    
+                    # Prepare tool arguments based on the query
+                    arguments = self._prepare_tool_arguments(tool_name, query)
+                    
+                    # Call the tool
+                    result = await self.router.call_tool(server_id, tool_name, arguments)
+                    
+                    if result.get('success'):
+                        yield f"✅ 工具 {tool_name} 执行成功\n"
+                        yield f"📝 结果：{result.get('result', 'No result')}\n"
+                        tool_results.append({
+                            'tool': tool_name,
+                            'success': True,
+                            'result': result.get('result')
+                        })
+                    else:
+                        yield f"❌ 工具 {tool_name} 执行失败：{result.get('error', 'Unknown error')}\n"
+                        tool_results.append({
+                            'tool': tool_name,
+                            'success': False,
+                            'error': result.get('error')
+                        })
+                
+                # Add tool results to the response
+                parsed['tool_results'] = tool_results
+            else:
+                yield "📋 无需执行具体工具\n"
+        else:
+            reason = parsed.get('reason', 'no reason provided')
+            yield f"❌ 无法执行任务：{reason}\n"
+        
+        # 5. 返回最终结果
+        yield "\n🎉 处理完成！\n"
+        yield f"📊 最终结果：{json.dumps(parsed, ensure_ascii=False)}\n"
 
     def _prepare_tool_arguments(self, tool_name: str, query: str) -> Dict[str, Any]:
         """Prepare arguments for tool calls based on the tool name and query"""
@@ -149,7 +293,7 @@ class Processor:
         elif tool_name == "retrieve_memory":
             return {
                 "query": query,
-                "limit": 10,
+                "limit": 5,
                 "include_metadata": True
             }
         else:

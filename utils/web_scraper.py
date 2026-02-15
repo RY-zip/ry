@@ -10,12 +10,23 @@ import httpx
 import random
 import re
 import platform
+import time
 from typing import Dict, List, Any, Optional, Union
 import logging
 from urllib.parse import quote
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage
 from bs4 import BeautifulSoup
+
+# 缓存配置
+CACHE_DURATION = 300  # 缓存时长，单位：秒
+_trending_cache = {
+    'data': None,
+    'timestamp': 0
+}
+
+# 全局锁，防止并发刷新缓存
+_cache_lock = asyncio.Lock()
 
 # 从 language_utils 导入区域检测功能
 try:
@@ -600,8 +611,8 @@ async def _fetch_twitter_trending_fallback(limit: int = 10) -> Dict[str, Any]:
     }
 
 
-async def fetch_trending_content(bilibili_limit: int = 10, weibo_limit: int = 10, 
-                                  reddit_limit: int = 10, twitter_limit: int = 10) -> Dict[str, Any]:
+async def fetch_trending_content(bilibili_limit: int = 5, weibo_limit: int = 5, 
+                                  reddit_limit: int = 5, twitter_limit: int = 5) -> Dict[str, Any]:
     """
     根据用户区域获取热门内容
     
@@ -619,93 +630,116 @@ async def fetch_trending_content(bilibili_limit: int = 10, weibo_limit: int = 10
         中文区域：'bilibili' 和 'weibo' 键
         非中文区域：'reddit' 和 'twitter' 键
     """
-    try:
-        # 检测用户区域
-        china_region = is_china_region()
+    global _trending_cache
+    
+    # 检查缓存是否有效
+    current_time = time.time()
+    if _trending_cache['data'] and (current_time - _trending_cache['timestamp'] < CACHE_DURATION):
+        logger.info("使用缓存的热门内容")
+        return _trending_cache['data']
+    
+    # 缓存过期，获取新数据
+    async with _cache_lock:
+        # 再次检查缓存，防止并发请求
+        current_time = time.time()
+        if _trending_cache['data'] and (current_time - _trending_cache['timestamp'] < CACHE_DURATION):
+            logger.info("使用缓存的热门内容（双重检查）")
+            return _trending_cache['data']
         
-        if china_region:
-            # Chinese region: Use Bilibili and Weibo
-            logger.info("检测到中文区域，获取B站和微博热门内容")
+        try:
+            # 检测用户区域
+            china_region = is_china_region()
             
-            bilibili_task = fetch_bilibili_trending(bilibili_limit)
-            weibo_task = fetch_weibo_trending(weibo_limit)
+            if china_region:
+                # Chinese region: Use Bilibili and Weibo
+                logger.info("检测到中文区域，获取B站和微博热门内容")
+                
+                bilibili_task = fetch_bilibili_trending(bilibili_limit)
+                weibo_task = fetch_weibo_trending(weibo_limit)
+                
+                bilibili_result, weibo_result = await asyncio.gather(
+                    bilibili_task, 
+                    weibo_task,
+                    return_exceptions=True
+                )
+                
+                # 处理异常
+                if isinstance(bilibili_result, Exception):
+                    logger.error(f"B站爬取异常: {bilibili_result}")
+                    bilibili_result = {'success': False, 'error': str(bilibili_result)}
+                
+                if isinstance(weibo_result, Exception):
+                    logger.error(f"微博爬取异常: {weibo_result}")
+                    weibo_result = {'success': False, 'error': str(weibo_result)}
+                
+                # 检查是否至少有一个成功
+                if not bilibili_result.get('success') and not weibo_result.get('success'):
+                    result = {
+                        'success': False,
+                        'error': '无法获取任何热门内容',
+                        'region': 'china',
+                        'bilibili': bilibili_result,
+                        'weibo': weibo_result
+                    }
+                else:
+                    result = {
+                        'success': True,
+                        'region': 'china',
+                        'bilibili': bilibili_result,
+                        'weibo': weibo_result
+                    }
+            else:
+                # 非中文区域：使用Reddit和Twitter
+                logger.info("检测到非中文区域，获取Reddit和Twitter热门内容")
+                
+                reddit_task = fetch_reddit_popular(reddit_limit)
+                twitter_task = fetch_twitter_trending(twitter_limit)
+                
+                reddit_result, twitter_result = await asyncio.gather(
+                    reddit_task,
+                    twitter_task,
+                    return_exceptions=True
+                )
+                
+                # 处理异常
+                if isinstance(reddit_result, Exception):
+                    logger.error(f"Reddit爬取异常: {reddit_result}")
+                    reddit_result = {'success': False, 'error': str(reddit_result)}
+                
+                if isinstance(twitter_result, Exception):
+                    logger.error(f"Twitter爬取异常: {twitter_result}")
+                    twitter_result = {'success': False, 'error': str(twitter_result)}
+                
+                # 检查是否至少有一个成功
+                if not reddit_result.get('success') and not twitter_result.get('success'):
+                    result = {
+                        'success': False,
+                        'error': '无法获取任何热门内容',
+                        'region': 'non-china',
+                        'reddit': reddit_result,
+                        'twitter': twitter_result
+                    }
+                else:
+                    result = {
+                        'success': True,
+                        'region': 'non-china',
+                        'reddit': reddit_result,
+                        'twitter': twitter_result
+                    }
             
-            bilibili_result, weibo_result = await asyncio.gather(
-                bilibili_task, 
-                weibo_task,
-                return_exceptions=True
-            )
+            # 更新缓存
+            _trending_cache['data'] = result
+            _trending_cache['timestamp'] = current_time
+            logger.info(f"热门内容已更新缓存，有效期{int(CACHE_DURATION/60)}分钟")
             
-            # 处理异常
-            if isinstance(bilibili_result, Exception):
-                logger.error(f"B站爬取异常: {bilibili_result}")
-                bilibili_result = {'success': False, 'error': str(bilibili_result)}
-            
-            if isinstance(weibo_result, Exception):
-                logger.error(f"微博爬取异常: {weibo_result}")
-                weibo_result = {'success': False, 'error': str(weibo_result)}
-            
-            # 检查是否至少有一个成功
-            if not bilibili_result.get('success') and not weibo_result.get('success'):
-                return {
-                    'success': False,
-                    'error': '无法获取任何热门内容',
-                    'region': 'china',
-                    'bilibili': bilibili_result,
-                    'weibo': weibo_result
-                }
-            
-            return {
-                'success': True,
-                'region': 'china',
-                'bilibili': bilibili_result,
-                'weibo': weibo_result
-            }
-        else:
-            # 非中文区域：使用Reddit和Twitter
-            logger.info("检测到非中文区域，获取Reddit和Twitter热门内容")
-            
-            reddit_task = fetch_reddit_popular(reddit_limit)
-            twitter_task = fetch_twitter_trending(twitter_limit)
-            
-            reddit_result, twitter_result = await asyncio.gather(
-                reddit_task,
-                twitter_task,
-                return_exceptions=True
-            )
-            
-            # 处理异常
-            if isinstance(reddit_result, Exception):
-                logger.error(f"Reddit爬取异常: {reddit_result}")
-                reddit_result = {'success': False, 'error': str(reddit_result)}
-            
-            if isinstance(twitter_result, Exception):
-                logger.error(f"Twitter爬取异常: {twitter_result}")
-                twitter_result = {'success': False, 'error': str(twitter_result)}
-            
-            # 检查是否至少有一个成功
-            if not reddit_result.get('success') and not twitter_result.get('success'):
-                return {
-                    'success': False,
-                    'error': '无法获取任何热门内容',
-                    'region': 'non-china',
-                    'reddit': reddit_result,
-                    'twitter': twitter_result
-                }
-            
-            return {
-                'success': True,
-                'region': 'non-china',
-                'reddit': reddit_result,
-                'twitter': twitter_result
-            }
+            return result
         
-    except Exception as e:
-        logger.error(f"获取热门内容失败: {e}")
-        return {
-            'success': False,
-            'error': str(e)
-        }
+        except Exception as e:
+            logger.error(f"获取热门内容失败: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
 
 def format_trending_content(trending_content: Dict[str, Any]) -> str:
